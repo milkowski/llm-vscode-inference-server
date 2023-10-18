@@ -16,8 +16,25 @@ app = FastAPI()
 engine = None
 
 
-@app.post("/generate")
-async def generate(request: Request) -> Response:
+async def parse_request(request: Request) -> dict:
+    request_dict = await request.json()
+    prompt = request_dict.pop("inputs")
+    parameters = request_dict.pop("parameters")
+    max_new_tokens = parameters.pop("max_new_tokens")
+    return_full_text = parameters.pop("return_full_text", False)
+    do_sample = parameters.pop("do_sample", True)
+
+    sampling_params = SamplingParams(max_tokens=max_new_tokens,
+                                     use_beam_search=not do_sample,
+                                     **parameters)
+
+    return {"prompt": prompt,
+            "parameters": sampling_params,
+            "return_full_text": return_full_text}
+
+
+@app.post("/")
+async def root(request: Request) -> Response:
     """Generate completion for the request.
 
     The request should be a JSON object with the following fields:
@@ -25,35 +42,22 @@ async def generate(request: Request) -> Response:
     - stream: whether to stream the results or not.
     - other fields: the sampling parameters (See `SamplingParams` for details).
     """
+
     request_dict = await request.json()
-    prompt = request_dict.pop("inputs")
-    parameters = request_dict.pop("parameters")
-    max_new_tokens = parameters.pop("max_new_tokens")
-    return_full_text = parameters.pop("return_full_text", False)
-    do_sample = parameters.pop("do_sample", True)
     stream = request_dict.pop("stream", False)
-    sampling_params = SamplingParams(max_tokens=max_new_tokens,
-                                     use_beam_search=not do_sample,
-                                     **parameters)
-    request_id = random_uuid()
-
-    results_generator = engine.generate(prompt, sampling_params, request_id)
-
-    # Streaming case
-    async def stream_results() -> AsyncGenerator[bytes, None]:
-        async for request_output in results_generator:
-            prompt = request_output.prompt
-            text_outputs = [
-                prompt + output.text if return_full_text else output.text
-                for output in request_output.outputs
-            ]
-            ret = {"text": text_outputs}
-            yield (json.dumps(ret) + "\0").encode("utf-8")
-
     if stream:
-        return StreamingResponse(stream_results())
+        return await generate_stream(request)
+    else:
+        return await generate(request)
 
-    # Non-streaming case
+
+@app.post("/generate")
+async def generate(request: Request) -> Response:
+    request_id = random_uuid()
+    query = await parse_request(request)
+    results_generator = engine.generate(query["prompt"],
+                                        query["parameters"],
+                                        request_id)
     final_output = None
     async for request_output in results_generator:
         if await request.is_disconnected():
@@ -65,11 +69,35 @@ async def generate(request: Request) -> Response:
     assert final_output is not None
     prompt = final_output.prompt
     text_outputs = [
-        prompt + output.text if return_full_text else output.text
-        for output in final_output.outputs
-    ]
+        prompt + output.text if query["return_full_text"] else output.text
+        for output in final_output.outputs]
     ret = {"generated_text": text_outputs[0], "status": 200}
     return JSONResponse(ret)
+
+
+@app.post("/generate_stream")
+async def generate_stream(request: Request) -> Response:
+    request_id = random_uuid()
+    query = await parse_request(request)
+    results_generator = engine.generate(query["prompt"],
+                                        query["parameters"],
+                                        request_id)
+
+    async def stream_results() -> AsyncGenerator[bytes, None]:
+        async for request_output in results_generator:
+            #prompt = request_output.prompt
+            #text_outputs = [
+            #    prompt + output.text if query["return_full_text"] else output.text
+            #    for output in request_output.outputs]
+            output = request_output.outputs[0]
+            ret = {"token":
+                    {"text": output.text,
+                     "id": request_output.request_id,
+                     "logprob": output.cumulative_logprob,
+                     "special": False}}
+            yield (json.dumps(ret) + "\n").encode("utf-8")
+
+    return StreamingResponse(stream_results())
 
 
 if __name__ == "__main__":
